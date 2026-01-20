@@ -92,7 +92,7 @@ Used for tracking position modifications in the audit trail.
 | PARTIAL_CLOSE | 4 | Close X%, withdraw equity |
 | REPAY_DEBT | 5 | Manual debt repayment |
 
-`The other values (3, 6, 7, 8, 9) exist in the schema for future use but are not documented in the API since they're not implemented yet.`
+The other values (3, 6, 7, 8, 9) exist in the schema for future use but are not documented in the API since they're not implemented yet.
 ---
 
 ## Market Data
