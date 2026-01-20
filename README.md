@@ -81,6 +81,18 @@ The system maps the concept of **Long** and **Short** positions to the underlyin
 | SHORT | 1 | Collateral is the short asset |
 | ANY | 2 | Reserved for future use (Currently throws error) |
 
+### PositionUpdateType
+Used for tracking position modifications in the audit trail.
+
+| Name | Value | Description |
+|------|-------|-------------|
+| INCREASE_LEVERAGE | 0 | Borrow more → higher leverage |
+| DELEVERAGE | 1 | Repay debt → lower leverage |
+| ADD_COLLATERAL | 2 | Add margin → better health |
+| PARTIAL_CLOSE | 4 | Close X%, withdraw equity |
+| REPAY_DEBT | 5 | Manual debt repayment |
+
+`The other values (3, 6, 7, 8, 9) exist in the schema for future use but are not documented in the API since they're not implemented yet.`
 ---
 
 ## Market Data
@@ -292,6 +304,454 @@ Submits signed transactions to close a position and updates the database.
   }
   ```
 - **Response**: Updated position record and transaction metadata.
+
+---
+
+## Position Management - Modifications
+
+These endpoints allow users to modify existing positions without fully closing them. All modification endpoints support **Kamino** and **Drift** protocols.
+
+### Conceptual Overview
+
+| Operation | What Changes | Equity | Leverage | Use Case |
+|-----------|--------------|--------|----------|----------|
+| **Partial Close** | Position size ↓ | Withdrawn to wallet | Same | "Take some profits" |
+| **Deleverage** | Risk ↓ | Stays in position | Lower | "Reduce my risk" |
+| **Increase Leverage** | Risk ↑ | Stays in position | Higher | "Maximize exposure" |
+| **Add Collateral** | Safety ↑ | Increases | Lower | "Improve health" |
+| **Repay Debt** | Debt ↓ | Increases | Lower | "Pay down loan" |
+
+### Partial Close Position
+
+Closes a specified percentage of the position and withdraws proportional equity to the user's wallet. **Leverage stays the same** - only position size decreases.
+
+**Example (60% partial close at 5x leverage):**
+- Before: 5 SOL ($500), 400 USDC debt, $100 equity
+- After: 2 SOL ($200), 160 USDC debt, $40 equity in position, **$60 withdrawn**
+- Leverage: Still 5x
+
+- **URL**: `/position/partial-close`
+- **Method**: `POST`
+- **Supported Protocols**: Kamino (1), Drift (3)
+- **Body** (`PartialClosePositionRequestBody`):
+  ```ts
+  {
+    "protocol": number,           // LendingProtocol (1=Kamino, 3=Drift)
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "closePercentage": number,    // 1-99 (percentage to close)
+    "jitoTipLamport": number,
+    "slippageBps": number,
+    "useDirectRoute": boolean,
+    "swapPlatform": "dflow" | "jupiter"  // Optional
+  }
+  ```
+- **Response** (`PartialClosePositionResponseBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "closePercentage": number,
+
+    // Before state
+    "depositAmountUIBefore": number,
+    "borrowAmountUIBefore": number,
+    "leverageBefore": number,
+    "marginAmountUIBefore": number,
+
+    // After state (estimated)
+    "depositAmountUIAfter": number,
+    "borrowAmountUIAfter": number,
+    "leverageAfter": number,
+    "marginAmountUIAfter": number,
+
+    // What user receives
+    "equityWithdrawnUI": number,
+    "equityWithdrawnMint": "string",
+
+    // Prices
+    "longTokenPriceUSD": number,
+    "shortTokenPriceUSD": number,
+
+    // Fees & APY
+    "feesMetadata": object,
+    "lendingApyAtClose": number,
+    "borrowingApyAtClose": number,
+
+    // Transactions (to be signed)
+    "signedTxs": ["string"],
+
+    // Data for submission
+    "updateRecordData": object
+  }
+  ```
+
+### Deleverage Position
+
+Reduces leverage to a target level while **keeping the same equity**. User doesn't receive anything - equity stays in the position but with less risk.
+
+**Example (5x → 3x deleverage):**
+- Before: 5 SOL ($500), 400 USDC debt, $100 equity, 5x leverage
+- After: 3 SOL ($300), 200 USDC debt, $100 equity, **3x leverage**
+- User receives: Nothing (equity stays in position)
+
+- **URL**: `/position/deleverage`
+- **Method**: `POST`
+- **Supported Protocols**: Kamino (1), Drift (3)
+- **Body** (`DeleveragePositionRequestBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "targetLeverage": number,     // Must be >= 1.0 and < current leverage
+    "jitoTipLamport": number,
+    "slippageBps": number,
+    "useDirectRoute": boolean,
+    "swapPlatform": "dflow" | "jupiter"  // Optional
+  }
+  ```
+- **Response** (`DeleveragePositionResponseBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+
+    // Leverage change
+    "leverageBefore": number,
+    "leverageAfter": number,
+    "targetLeverage": number,
+
+    // Before state
+    "depositAmountUIBefore": number,
+    "borrowAmountUIBefore": number,
+    "marginAmountUIBefore": number,
+
+    // After state (estimated)
+    "depositAmountUIAfter": number,
+    "borrowAmountUIAfter": number,
+    "marginAmountUIAfter": number,
+
+    // Prices
+    "longTokenPriceUSD": number,
+    "shortTokenPriceUSD": number,
+
+    // Fees & APY
+    "feesMetadata": object,
+    "lendingApyAtUpdate": number,
+    "borrowingApyAtUpdate": number,
+
+    // Transactions
+    "signedTxs": ["string"],
+
+    // Data for submission
+    "updateRecordData": object
+  }
+  ```
+
+### Increase Leverage Position
+
+Increases leverage to a target level while **keeping the same equity**. Position grows with same equity but more risk.
+
+**Example (3x → 5x increase):**
+- Before: 3 SOL ($300), 200 USDC debt, $100 equity, 3x leverage
+- After: 5 SOL ($500), 400 USDC debt, $100 equity, **5x leverage**
+- User provides: Nothing (borrows more to increase position)
+
+- **URL**: `/position/increase-leverage`
+- **Method**: `POST`
+- **Supported Protocols**: Kamino (1), Drift (3)
+- **Body** (`IncreaseLeverageRequestBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "targetLeverage": number,     // Must be > current leverage
+    "jitoTipLamport": number,
+    "slippageBps": number,
+    "useDirectRoute": boolean,
+    "swapPlatform": "dflow" | "jupiter"  // Optional
+  }
+  ```
+- **Response** (`IncreaseLeverageResponseBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+
+    // Leverage change
+    "leverageBefore": number,
+    "leverageAfter": number,
+    "targetLeverage": number,
+
+    // Before state
+    "depositAmountUIBefore": number,
+    "borrowAmountUIBefore": number,
+    "marginAmountUIBefore": number,
+
+    // After state (estimated)
+    "depositAmountUIAfter": number,
+    "borrowAmountUIAfter": number,
+    "marginAmountUIAfter": number,
+
+    // Prices
+    "longTokenPriceUSD": number,
+    "shortTokenPriceUSD": number,
+
+    // Fees & APY
+    "feesMetadata": object,
+    "lendingApyAtUpdate": number,
+    "borrowingApyAtUpdate": number,
+
+    // Transactions
+    "signedTxs": ["string"],
+
+    // Data for submission
+    "updateRecordData": object
+  }
+  ```
+
+### Add Collateral to Position
+
+Adds collateral to an existing position, **reducing leverage and improving health**. Supports adding collateral in either the LONG or SHORT token.
+
+**Example (adding $50 LONG collateral at 5x):**
+- Before: 5 SOL ($500), 400 USDC debt, $100 equity, 5x leverage
+- After: 5.5 SOL ($550), 400 USDC debt, $150 equity, **~3.67x leverage**
+
+- **URL**: `/position/add-collateral`
+- **Method**: `POST`
+- **Supported Protocols**: Kamino (1), Drift (3)
+- **Body** (`AddCollateralRequestBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "collateralAmountNative": number,  // Amount to add (in native units)
+    "collateralType": number,          // 0=LONG (direct deposit), 1=SHORT (swap then deposit)
+    "collateralMint": "string",        // Mint of the token being provided
+    "jitoTipLamport": number,
+    "slippageBps": number,             // Only needed if collateralType=SHORT (swap required)
+    "useDirectRoute": boolean,
+    "swapPlatform": "dflow" | "jupiter"  // Optional
+  }
+  ```
+- **Response** (`AddCollateralResponseBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+
+    // What was added
+    "collateralAddedNative": number,
+    "collateralAddedUI": number,
+    "collateralMint": "string",
+    "collateralType": number,
+
+    // Leverage change
+    "leverageBefore": number,
+    "leverageAfter": number,
+
+    // Before state
+    "depositAmountUIBefore": number,
+    "borrowAmountUIBefore": number,
+    "marginAmountUIBefore": number,
+
+    // After state
+    "depositAmountUIAfter": number,
+    "borrowAmountUIAfter": number,
+    "marginAmountUIAfter": number,
+
+    // Prices
+    "longTokenPriceUSD": number,
+    "shortTokenPriceUSD": number,
+
+    // Fees & APY
+    "feesMetadata": object,
+    "lendingApyAtUpdate": number,
+    "borrowingApyAtUpdate": number,
+
+    // Transactions
+    "signedTxs": ["string"],
+
+    // Data for submission
+    "updateRecordData": object
+  }
+  ```
+
+### Repay Debt on Position
+
+Manually repays debt using user's funds (SHORT token), **reducing leverage and improving margin**. This is a direct debt repayment without any swap.
+
+**Example (repaying 100 USDC debt):**
+- Before: 5 SOL ($500), 400 USDC debt, 5x leverage
+- After: 5 SOL ($500), 300 USDC debt, **~2.5x leverage**
+
+- **URL**: `/position/repay-debt`
+- **Method**: `POST`
+- **Supported Protocols**: Kamino (1), Drift (3)
+- **Body** (`RepayDebtRequestBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "repayAmountNative": number,   // Amount to repay (in SHORT/debt token native units)
+    "jitoTipLamport": number
+  }
+  ```
+- **Response** (`RepayDebtResponseBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+
+    // What was repaid
+    "repayAmountNative": number,
+    "repayAmountUI": number,
+    "debtTokenMint": "string",
+
+    // Before state
+    "depositAmountUIBefore": number,
+    "borrowAmountUIBefore": number,
+    "leverageBefore": number,
+    "marginAmountUIBefore": number,
+
+    // After state
+    "depositAmountUIAfter": number,   // Same as before
+    "borrowAmountUIAfter": number,    // Lower
+    "leverageAfter": number,          // Lower
+
+    // Prices
+    "longTokenPriceUSD": number,
+    "shortTokenPriceUSD": number,
+
+    // Fees & APY
+    "feesMetadata": object,
+    "lendingApyAtUpdate": number,
+    "borrowingApyAtUpdate": number,
+
+    // Transactions
+    "signedTxs": ["string"],
+
+    // Data for submission
+    "updateRecordData": object
+  }
+  ```
+
+### Submit Position Update Transaction
+
+**Unified submission endpoint** for ALL position modifications. After signing the transactions from any of the above endpoints, submit them here.
+
+- **URL**: `/submit-position-update-tx`
+- **Method**: `POST`
+- **Body** (`SubmitPositionUpdateTxRequestBody`):
+  ```ts
+  {
+    "protocol": number,
+    "walletPubkey": "string",
+    "positionPDA": "string",
+    "positionId": number,            // margin_positions.id (from your position record)
+    "tokenATokenMint": "string",
+    "tokenBTokenMint": "string",
+    
+    // CRITICAL: Signed transactions
+    "signedTxs": ["string"],
+    
+    // Pass back the updateRecordData from the response
+    "updateRecordData": {
+      "updateType": number,          // PositionUpdateType enum
+      "updatePercentage": number | null,
+      
+      "preTokenAAmountUI": number,
+      "preTokenBAmountUI": number,
+      "preLeverage": number,
+      "preMarginAmountUI": number | null,
+      
+      "collateralType": number | null,
+      "collateralMint": "string" | null,
+      "collateralAmountNative": number | null,
+      "collateralAmountUI": number | null,
+      
+      "swapInAmount": number | null,
+      "swapInMint": "string" | null,
+      "swapOutAmount": number | null,
+      "swapOutMint": "string" | null,
+      
+      "postTokenAAmountUI": number,
+      "postTokenBAmountUI": number,
+      "postLeverage": number,
+      "postMarginAmountUI": number | null,
+      
+      "tokenAPriceUSD": number,
+      "tokenBPriceUSD": number
+    },
+    
+    // Optional metadata
+    "feesMetadata": object,
+    "swapRouteMetadata": object,
+    "lendingApyAtUpdate": number,
+    "borrowingApyAtUpdate": number
+  }
+  ```
+- **Response** (`SubmitPositionUpdateTxResponseBody`):
+  ```ts
+  {
+    "success": boolean,
+    "txHash": "string",
+    "txMetadata": object,
+    
+    // Created audit record
+    "positionUpdate": {
+      "id": number,
+      "updateType": number,
+      "status": number   // 1 = confirmed
+    },
+    
+    // Updated position state
+    "position": {
+      "id": number,
+      "tokenAAmountUICurrent": "string",
+      "tokenBAmountUICurrent": "string",
+      "leverageCurrent": "string",
+      "updateCount": number
+    }
+  }
+  ```
+
+### Integration Flow for Position Modifications
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. Call modification endpoint (e.g., /position/deleverage)    │
+│     → Returns unsigned transactions + updateRecordData         │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. Sign transactions with user's wallet                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  3. Call /submit-position-update-tx                            │
+│     → Pass signed txs + updateRecordData                       │
+│     → Creates audit trail in position_updates table            │
+│     → Updates margin_positions with current state              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  4. Receive confirmation with txHash and updated position      │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -515,6 +975,90 @@ const executedPrice = meta.outputAmount / meta.inputAmount;
 | `closeTxHash` | String | The transaction hash that closed the position (Null if active). |
 | `openedAt` | Timestamp | UTC timestamp of creation. |
 | `closedAt` | Timestamp | UTC timestamp of closure (Null if active). |
+
+### Current State Tracking (Position Modifications)
+
+These fields track the **current state** of the position after modifications. If null, use the Entry values (position hasn't been modified).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tokenAAmountUICurrent` | Decimal | Current deposit/long amount (null if unmodified). |
+| `tokenBAmountUICurrent` | Decimal | Current borrow/short amount (null if unmodified). |
+| `leverageCurrent` | Decimal | Current leverage after modifications (null if unmodified). |
+| `lastUpdateId` | Integer | Reference to the most recent `position_updates.id`. |
+| `updateCount` | Integer | Number of times the position has been modified. |
+
+**Integrator Note**: To get the current position state:
+```javascript
+// Get current amounts (fallback to entry if never modified)
+const currentDeposit = position.tokenAAmountUICurrent ?? position.tokenAAmountUIEntry;
+const currentBorrow = position.tokenBAmountUICurrent ?? position.tokenBAmountUIEntry;
+const currentLeverage = position.leverageCurrent ?? position.leverage;
+```
+
+---
+
+## Position Updates (Audit Trail)
+
+Every position modification is recorded in the `position_updates` table for complete audit trail and historical analysis.
+
+### Position Updates Schema
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | Integer | Unique primary key. |
+| `positionId` | Integer | Reference to `margin_positions.id`. |
+| `positionPda` | String | Position PDA for easy querying. |
+| `ownerAddress` | String | Wallet address. |
+| `protocol` | Integer | LendingProtocol enum. |
+| `updateType` | Integer | PositionUpdateType enum (see Enums section). |
+| `updatePercentage` | Decimal | For PARTIAL_CLOSE: percentage closed (1-99). |
+
+### Pre-Update State
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `preTokenAAmountUI` | Decimal | Deposit/Long amount before update. |
+| `preTokenBAmountUI` | Decimal | Borrow/Short amount before update. |
+| `preLeverage` | Decimal | Leverage before update. |
+| `preMarginAmountUI` | Decimal | Net margin before update. |
+
+### Update Details
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `collateralType` | Integer | CollateralType enum - what token was provided/received. |
+| `collateralMint` | String | Mint address of collateral token. |
+| `collateralAmountNative` | Decimal | Amount of collateral added/removed (native units). |
+| `collateralAmountUI` | Decimal | Amount of collateral added/removed (UI units). |
+| `swapInAmount` | Decimal | Amount swapped in (if applicable). |
+| `swapInMint` | String | Mint of swap input. |
+| `swapOutAmount` | Decimal | Amount received from swap. |
+| `swapOutMint` | String | Mint of swap output. |
+
+### Post-Update State
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `postTokenAAmountUI` | Decimal | Deposit/Long amount after update. |
+| `postTokenBAmountUI` | Decimal | Borrow/Short amount after update. |
+| `postLeverage` | Decimal | Leverage after update. |
+| `postMarginAmountUI` | Decimal | Net margin after update. |
+| `tokenAPriceUSD` | Decimal | TokenA price at update time. |
+| `tokenBPriceUSD` | Decimal | TokenB price at update time. |
+
+### Transaction & Status
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `txHash` | String | Transaction hash for the update. |
+| `txMetadata` | JSON | Full transaction metadata. |
+| `swapRouteMetadata` | JSON | Swap routing details (if applicable). |
+| `feesMetadata` | JSON | Detailed fee breakdown. |
+| `status` | Integer | 0=pending, 1=confirmed, 2=failed. |
+| `finalized` | Boolean | Whether transaction is finalized on-chain. |
+| `createdAt` | Timestamp | When the update was initiated. |
+| `confirmedAt` | Timestamp | When the update was confirmed. |
 
 ---
 
